@@ -1,0 +1,12 @@
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    ports:
+      # Public admin interface. Prefer localhost binding plus a protected proxy.
+      - "9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer-data:/data
+
+volumes:
+  portainer-data:
