@@ -21,3 +21,8 @@ Thumbs.db
 # Reports
 *.sarif
 exposeguard-report.*
+
+# Local Codex / agent instructions
+AGENTS.md
+CODEX_TASK.md
+.codex/
