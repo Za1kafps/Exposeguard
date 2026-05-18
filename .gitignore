@@ -1,0 +1,23 @@
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reports
+*.sarif
+exposeguard-report.*
