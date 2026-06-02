@@ -2,6 +2,7 @@ package report
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -16,6 +17,7 @@ const (
 	FormatTerminal Format = "terminal"
 	FormatJSON     Format = "json"
 	FormatMarkdown Format = "markdown"
+	FormatSARIF    Format = "sarif"
 )
 
 type RenderOptions struct {
@@ -31,6 +33,8 @@ func ParseFormat(value string) (Format, error) {
 		return FormatJSON, nil
 	case "markdown":
 		return FormatMarkdown, nil
+	case "sarif":
+		return FormatSARIF, nil
 	default:
 		return "", fmt.Errorf("invalid report format %q", value)
 	}
@@ -52,6 +56,12 @@ func RenderWithOptions(format Format, report model.Report, options RenderOptions
 		return append(data, '\n'), nil
 	case FormatMarkdown:
 		return []byte(RenderMarkdown(report)), nil
+	case FormatSARIF:
+		data, err := json.MarshalIndent(BuildSARIF(report), "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		return append(data, '\n'), nil
 	default:
 		return nil, fmt.Errorf("unsupported report format %q", format)
 	}
@@ -91,8 +101,9 @@ func RenderTerminalConcise(report model.Report, detailHint string) string {
 					fmt.Fprintf(&out, "    Binding: %s/%s\n", finding.Binding, finding.Protocol)
 				}
 				if len(finding.Fixes) > 0 {
-					fmt.Fprintf(&out, "    Fix: %s\n", finding.Fixes[0])
+					fmt.Fprintf(&out, "    Fix: %s\n", finding.Fixes[0].Summary)
 				}
+				fmt.Fprintf(&out, "    Chain: %s\n", chainSummary(finding))
 				fmt.Fprintf(&out, "\n")
 			}
 		}
@@ -146,18 +157,36 @@ func RenderTerminalDetailed(report model.Report) string {
 			if finding.Binding != "" {
 				fmt.Fprintf(&out, "    Binding: %s/%s\n", finding.Binding, finding.Protocol)
 			}
+			fmt.Fprintf(&out, "    Intent: %s (%s)\n", emptyDefault(finding.Intent.Category, "unknown"), emptyDefault(finding.Intent.Confidence, "low"))
+			if chain := chainSummary(finding); chain != "" {
+				fmt.Fprintf(&out, "    Chain: %s\n", chain)
+			}
 			fmt.Fprintf(&out, "    Reason: %s\n", finding.Reason)
 			fmt.Fprintf(&out, "    Impact: %s\n", finding.Impact)
 			if len(finding.Evidence) > 0 {
 				fmt.Fprintf(&out, "    Evidence:\n")
 				for _, item := range finding.Evidence {
-					fmt.Fprintf(&out, "      - %s\n", item)
+					fmt.Fprintf(&out, "      - [%s/%s] %s\n", item.Source, emptyDefault(item.Confidence, "unknown"), item.Summary)
+					if len(item.Details) > 0 {
+						for _, key := range sortedDetailKeys(item.Details) {
+							fmt.Fprintf(&out, "        %s: %s\n", key, item.Details[key])
+						}
+					}
 				}
 			}
 			if len(finding.Fixes) > 0 {
 				fmt.Fprintf(&out, "    Fixes:\n")
 				for _, fix := range finding.Fixes {
-					fmt.Fprintf(&out, "      - %s\n", fix)
+					fmt.Fprintf(&out, "      - %s: %s\n", fix.Title, fix.Summary)
+					if fix.ComposePatchHint != "" {
+						fmt.Fprintf(&out, "        Compose hint: %s\n", oneLine(fix.ComposePatchHint))
+					}
+					for _, command := range fix.Commands {
+						fmt.Fprintf(&out, "        Command: %s\n", command)
+					}
+					for _, warning := range fix.Warnings {
+						fmt.Fprintf(&out, "        Warning: %s\n", warning)
+					}
 				}
 			}
 			fmt.Fprintf(&out, "\n")
@@ -237,25 +266,245 @@ func RenderMarkdown(report model.Report) string {
 		if finding.Binding != "" {
 			fmt.Fprintf(&out, "- Binding: `%s/%s`\n", finding.Binding, finding.Protocol)
 		}
+		if finding.Intent.Category != "" {
+			fmt.Fprintf(&out, "- Intent: `%s` (`%s` confidence)\n", finding.Intent.Category, emptyDefault(finding.Intent.Confidence, "low"))
+		}
+		if chain := chainSummary(finding); chain != "" {
+			fmt.Fprintf(&out, "- Chain: %s\n", chain)
+		}
 		fmt.Fprintf(&out, "- Reason: %s\n", finding.Reason)
 		fmt.Fprintf(&out, "- Impact: %s\n\n", finding.Impact)
 		if len(finding.Evidence) > 0 {
 			fmt.Fprintf(&out, "Evidence:\n\n")
 			for _, evidence := range finding.Evidence {
-				fmt.Fprintf(&out, "- %s\n", evidence)
+				fmt.Fprintf(&out, "- `%s` (`%s`): %s\n", evidence.Source, emptyDefault(evidence.Confidence, "unknown"), evidence.Summary)
 			}
 			fmt.Fprintf(&out, "\n")
 		}
 		if len(finding.Fixes) > 0 {
 			fmt.Fprintf(&out, "Fix suggestions:\n\n")
-			fmt.Fprintf(&out, "```text\n")
 			for _, fix := range finding.Fixes {
-				fmt.Fprintf(&out, "- %s\n", fix)
+				fmt.Fprintf(&out, "- **%s:** %s\n", fix.Title, fix.Summary)
+				if fix.ComposePatchHint != "" {
+					fmt.Fprintf(&out, "\n```yaml\n%s\n```\n\n", fix.ComposePatchHint)
+				}
+				if len(fix.Commands) > 0 {
+					fmt.Fprintf(&out, "\n```sh\n")
+					for _, command := range fix.Commands {
+						fmt.Fprintf(&out, "%s\n", command)
+					}
+					fmt.Fprintf(&out, "```\n\n")
+				}
 			}
-			fmt.Fprintf(&out, "```\n\n")
+			fmt.Fprintf(&out, "\n")
 		}
 	}
 	return out.String()
+}
+
+type SARIFLog struct {
+	Version string     `json:"version"`
+	Schema  string     `json:"$schema"`
+	Runs    []SARIFRun `json:"runs"`
+}
+
+type SARIFRun struct {
+	Tool    SARIFTool     `json:"tool"`
+	Results []SARIFResult `json:"results"`
+}
+
+type SARIFTool struct {
+	Driver SARIFDriver `json:"driver"`
+}
+
+type SARIFDriver struct {
+	Name            string      `json:"name"`
+	SemanticVersion string      `json:"semanticVersion,omitempty"`
+	Rules           []SARIFRule `json:"rules,omitempty"`
+}
+
+type SARIFRule struct {
+	ID               string          `json:"id"`
+	Name             string          `json:"name,omitempty"`
+	ShortDescription SARIFText       `json:"shortDescription"`
+	FullDescription  SARIFText       `json:"fullDescription,omitempty"`
+	Properties       SARIFProperties `json:"properties,omitempty"`
+}
+
+type SARIFResult struct {
+	RuleID              string            `json:"ruleId"`
+	Level               string            `json:"level"`
+	Message             SARIFText         `json:"message"`
+	Locations           []SARIFLocation   `json:"locations,omitempty"`
+	Properties          SARIFProperties   `json:"properties,omitempty"`
+	PartialFingerprints map[string]string `json:"partialFingerprints,omitempty"`
+}
+
+type SARIFText struct {
+	Text string `json:"text"`
+}
+
+type SARIFLocation struct {
+	PhysicalLocation SARIFPhysicalLocation `json:"physicalLocation"`
+}
+
+type SARIFPhysicalLocation struct {
+	ArtifactLocation SARIFArtifactLocation `json:"artifactLocation"`
+	Region           SARIFRegion           `json:"region,omitempty"`
+}
+
+type SARIFArtifactLocation struct {
+	URI string `json:"uri"`
+}
+
+type SARIFRegion struct {
+	StartLine int `json:"startLine,omitempty"`
+}
+
+type SARIFProperties map[string]interface{}
+
+func BuildSARIF(report model.Report) SARIFLog {
+	rules := map[string]SARIFRule{}
+	var results []SARIFResult
+	for _, finding := range report.Findings {
+		ruleID := finding.RuleID
+		if ruleID == "" {
+			ruleID = finding.ID
+		}
+		if _, ok := rules[ruleID]; !ok {
+			rules[ruleID] = SARIFRule{
+				ID:               ruleID,
+				Name:             ruleName(ruleID),
+				ShortDescription: SARIFText{Text: finding.Title},
+
+				FullDescription: SARIFText{Text: finding.Impact},
+				Properties:      SARIFProperties{"severity": string(finding.Severity)},
+			}
+		}
+		results = append(results, SARIFResult{
+			RuleID:              ruleID,
+			Level:               sarifLevel(finding.Severity),
+			Message:             SARIFText{Text: sarifMessage(finding)},
+			Locations:           sarifLocations(finding),
+			Properties:          sarifProperties(finding),
+			PartialFingerprints: map[string]string{"exposureChain/v1": stableFingerprint(finding)},
+		})
+	}
+	return SARIFLog{
+		Version: "2.1.0",
+		Schema:  "https://json.schemastore.org/sarif-2.1.0.json",
+		Runs: []SARIFRun{{
+			Tool: SARIFTool{Driver: SARIFDriver{
+				Name:            "ExposeGuard",
+				SemanticVersion: report.Metadata.Version,
+				Rules:           sortedSARIFRules(rules),
+			}},
+			Results: results,
+		}},
+	}
+}
+
+func sarifMessage(finding model.Finding) string {
+	parts := []string{finding.Reason, finding.Impact}
+	if len(finding.Fixes) > 0 {
+		parts = append(parts, "Fix: "+finding.Fixes[0].Summary)
+	}
+	return strings.Join(nonEmpty(parts), " ")
+}
+
+func sarifProperties(finding model.Finding) SARIFProperties {
+	props := SARIFProperties{
+		"severity":   string(finding.Severity),
+		"intent":     finding.Intent.Category,
+		"confidence": finding.Intent.Confidence,
+	}
+	if finding.ServiceName != "" {
+		props["serviceName"] = finding.ServiceName
+	}
+	if finding.ContainerName != "" {
+		props["containerName"] = finding.ContainerName
+	}
+	if finding.PublishedPort != nil {
+		props["hostPort"] = finding.PublishedPort.HostPort
+		props["containerPort"] = finding.PublishedPort.ContainerPort
+		props["binding"] = model.BindingDescription(finding.PublishedPort.HostIP, finding.PublishedPort.HostPort)
+	} else if finding.Port != 0 {
+		props["hostPort"] = finding.Port
+		props["binding"] = finding.Binding
+	}
+	return props
+}
+
+func sarifLocations(finding model.Finding) []SARIFLocation {
+	if finding.Compose == nil || finding.Compose.File == "" {
+		return nil
+	}
+	return []SARIFLocation{{
+		PhysicalLocation: SARIFPhysicalLocation{
+			ArtifactLocation: SARIFArtifactLocation{URI: finding.Compose.File},
+			Region:           SARIFRegion{StartLine: 1},
+		},
+	}}
+}
+
+func sarifLevel(severity model.Severity) string {
+	switch severity {
+	case model.SeverityCritical, model.SeverityHigh:
+		return "error"
+	case model.SeverityMedium:
+		return "warning"
+	default:
+		return "note"
+	}
+}
+
+func stableFingerprint(finding model.Finding) string {
+	values := []string{finding.ID, finding.ServiceName, finding.ContainerName, finding.Binding, finding.Protocol, finding.RuleID}
+	if finding.PublishedPort != nil {
+		values = append(values,
+			fmt.Sprintf("%d", finding.PublishedPort.HostPort),
+			fmt.Sprintf("%d", finding.PublishedPort.ContainerPort),
+		)
+	} else {
+		values = append(values, fmt.Sprintf("%d", finding.Port))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(values, "|")))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func sortedSARIFRules(values map[string]SARIFRule) []SARIFRule {
+	rules := make([]SARIFRule, 0, len(values))
+	for _, rule := range values {
+		rules = append(rules, rule)
+	}
+	sort.Slice(rules, func(i, j int) bool { return rules[i].ID < rules[j].ID })
+	return rules
+}
+
+func ruleName(ruleID string) string {
+	names := map[string]string{
+		"EG-CRITICAL-001": "public-postgresql",
+		"EG-CRITICAL-002": "public-mysql-mariadb",
+		"EG-CRITICAL-003": "public-redis",
+		"EG-CRITICAL-004": "public-mongodb",
+		"EG-CRITICAL-005": "public-docker-daemon",
+		"EG-HIGH-001":     "public-admin-dashboard",
+		"EG-HIGH-002":     "public-portainer",
+		"EG-HIGH-003":     "public-grafana",
+		"EG-HIGH-004":     "public-prometheus",
+		"EG-HIGH-005":     "docker-socket-dashboard",
+		"EG-HIGH-006":     "reverse-proxy-bypass",
+		"EG-MEDIUM-001":   "unknown-public-service",
+		"EG-MEDIUM-002":   "host-network-mode",
+		"EG-MEDIUM-003":   "direct-http-without-proxy-context",
+		"EG-INFO-001":     "localhost-only-binding",
+		"EG-INFO-002":     "no-published-docker-ports",
+		"EG-INFO-003":     "firewall-state-unknown",
+	}
+	if name := names[ruleID]; name != "" {
+		return name
+	}
+	return strings.ToLower(ruleID)
 }
 
 func findingsBySeverity(findings []model.Finding, severity model.Severity) []model.Finding {
@@ -276,4 +525,52 @@ func emptyDefault(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func chainSummary(finding model.Finding) string {
+	parts := []string{}
+	if finding.Compose != nil && finding.Compose.ServiceName != "" {
+		parts = append(parts, "compose "+finding.Compose.ServiceName)
+	}
+	if finding.ContainerName != "" {
+		parts = append(parts, "container "+finding.ContainerName)
+	}
+	if finding.PublishedPort != nil {
+		parts = append(parts, fmt.Sprintf("published %s:%d->%d/%s", emptyDefault(finding.PublishedPort.HostIP, "0.0.0.0"), finding.PublishedPort.HostPort, finding.PublishedPort.ContainerPort, finding.PublishedPort.Protocol))
+	} else if finding.Binding != "" {
+		parts = append(parts, "binding "+finding.Binding)
+	}
+	if len(finding.Firewall) > 0 {
+		parts = append(parts, "firewall evidence")
+	}
+	if len(finding.Listener) > 0 {
+		parts = append(parts, "listener evidence")
+	}
+	if finding.Intent.Category != "" {
+		parts = append(parts, "risk "+finding.Intent.Category)
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func sortedDetailKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func oneLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func nonEmpty(values []string) []string {
+	var out []string
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
