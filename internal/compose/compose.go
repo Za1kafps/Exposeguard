@@ -20,13 +20,17 @@ type Service struct {
 	Image           string
 	Ports           []string
 	Expose          []string
+	Networks        []string
 	NetworkMode     string
 	Privileged      bool
 	Volumes         []string
 	EnvironmentKeys []string
 	Labels          map[string]string
+	Command         string
+	Healthcheck     string
 }
 
+// Parse file of compose or service
 func ParseFile(path string) (Project, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -43,17 +47,42 @@ func ParseFile(path string) (Project, error) {
 			Image:           service.Image,
 			Ports:           stringList(service.Ports),
 			Expose:          stringList(service.Expose),
+			Networks:        serviceNetworks(service.Networks),
 			NetworkMode:     scalarString(service.NetworkMode),
 			Privileged:      service.Privileged,
 			Volumes:         stringList(service.Volumes),
 			EnvironmentKeys: environmentKeys(service.Environment),
 			Labels:          labels(service.Labels),
+			Command:         scalarString(service.Command),
+			Healthcheck:     scalarString(service.Healthcheck),
 		})
 	}
+	// sorting all files and raw
 	sort.Slice(project.Services, func(i, j int) bool {
 		return project.Services[i].Name < project.Services[j].Name
 	})
 	return project, nil
+}
+
+// yaml nodes, content values
+func serviceNetworks(node yaml.Node) []string {
+	switch node.Kind {
+	case yaml.SequenceNode:
+		return stringList(node)
+	case yaml.MappingNode:
+		values := make([]string, 0, len(node.Content)/2)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value != "" {
+				values = append(values, node.Content[i].Value)
+			}
+		}
+		sort.Strings(values)
+		return values
+	case yaml.ScalarNode:
+		return stringList(node)
+	default:
+		return nil
+	}
 }
 
 func stringList(node yaml.Node) []string {
@@ -75,6 +104,7 @@ func stringList(node yaml.Node) []string {
 	}
 }
 
+// yaml node and ports
 func scalarString(node yaml.Node) string {
 	switch node.Kind {
 	case yaml.ScalarNode:
@@ -96,6 +126,7 @@ func scalarString(node yaml.Node) string {
 	}
 }
 
+// environment mapping content
 func environmentKeys(node yaml.Node) []string {
 	keys := map[string]struct{}{}
 	switch node.Kind {
@@ -118,6 +149,7 @@ func environmentKeys(node yaml.Node) []string {
 	return sortedKeys(keys)
 }
 
+// sort labels of content node
 func labels(node yaml.Node) map[string]string {
 	values := map[string]string{}
 	switch node.Kind {
@@ -141,6 +173,7 @@ func labels(node yaml.Node) map[string]string {
 	return values
 }
 
+// sort keys
 func sortedKeys(values map[string]struct{}) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -158,13 +191,17 @@ type composeService struct {
 	Image       string    `yaml:"image"`
 	Ports       yaml.Node `yaml:"ports"`
 	Expose      yaml.Node `yaml:"expose"`
+	Networks    yaml.Node `yaml:"networks"`
 	NetworkMode yaml.Node `yaml:"network_mode"`
 	Privileged  bool      `yaml:"privileged"`
 	Volumes     yaml.Node `yaml:"volumes"`
 	Environment yaml.Node `yaml:"environment"`
 	Labels      yaml.Node `yaml:"labels"`
+	Command     yaml.Node `yaml:"command"`
+	Healthcheck yaml.Node `yaml:"healthcheck"`
 }
 
+// parse of ports and protocols
 func ParsePublishedPort(value string) (hostIP string, hostPort int, containerPort int, protocol string, ok bool) {
 	protocol = "tcp"
 	portSpec, proto, hasProto := strings.Cut(value, "/")
