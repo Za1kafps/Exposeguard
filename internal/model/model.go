@@ -93,10 +93,11 @@ type Metadata struct {
 }
 
 type Report struct {
-	Metadata Metadata  `json:"metadata"`
-	Summary  Summary   `json:"summary"`
-	Findings []Finding `json:"findings"`
-	Warnings []Warning `json:"warnings,omitempty"`
+	Metadata     Metadata            `json:"metadata"`
+	Summary      Summary             `json:"summary"`
+	Findings     []Finding           `json:"findings"`
+	Warnings     []Warning           `json:"warnings,omitempty"`
+	Capabilities ScannerCapabilities `json:"scanner_capabilities"`
 }
 
 type Summary struct {
@@ -113,20 +114,107 @@ type Warning struct {
 	Message string `json:"message"`
 }
 
-type Finding struct {
-	ID            string   `json:"id"`
-	Title         string   `json:"title"`
-	Severity      Severity `json:"severity"`
-	ServiceName   string   `json:"service_name,omitempty"`
-	ContainerName string   `json:"container_name,omitempty"`
-	Image         string   `json:"image,omitempty"`
-	Port          int      `json:"port,omitempty"`
-	Protocol      string   `json:"protocol,omitempty"`
-	Binding       string   `json:"binding,omitempty"`
-	Reason        string   `json:"reason"`
-	Impact        string   `json:"impact"`
-	Evidence      []string `json:"evidence,omitempty"`
-	Fixes         []string `json:"fixes"`
+type ScannerCapabilities struct {
+	Docker    bool `json:"docker"`
+	Compose   bool `json:"compose"`
+	Firewall  bool `json:"firewall"`
+	Listeners bool `json:"listeners"`
+}
+
+type Finding = ExposureChain
+
+type ExposureChain struct {
+	ID       string   `json:"id"`
+	Severity Severity `json:"severity"`
+	RuleID   string   `json:"rule_id"`
+	Title    string   `json:"title"`
+
+	Compose       *ComposeEvidence       `json:"compose,omitempty"`
+	Container     *ContainerEvidence     `json:"container,omitempty"`
+	PublishedPort *PublishedPortEvidence `json:"published_port,omitempty"`
+	Firewall      []Evidence             `json:"firewall,omitempty"`
+	Listener      []Evidence             `json:"listener,omitempty"`
+
+	Intent       ServiceIntent         `json:"intent"`
+	ReverseProxy *ReverseProxyEvidence `json:"reverse_proxy,omitempty"`
+
+	ServiceName   string `json:"service_name,omitempty"`
+	ContainerName string `json:"container_name,omitempty"`
+	Image         string `json:"image,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	Protocol      string `json:"protocol,omitempty"`
+	Binding       string `json:"binding,omitempty"`
+
+	Reason   string     `json:"reason"`
+	Impact   string     `json:"impact"`
+	Fixes    []Fix      `json:"fixes"`
+	Evidence []Evidence `json:"evidence,omitempty"`
+}
+
+type ComposeEvidence struct {
+	File            string            `json:"file,omitempty"`
+	ServiceName     string            `json:"service_name,omitempty"`
+	Image           string            `json:"image,omitempty"`
+	Ports           []string          `json:"ports,omitempty"`
+	Expose          []string          `json:"expose,omitempty"`
+	Networks        []string          `json:"networks,omitempty"`
+	NetworkMode     string            `json:"network_mode,omitempty"`
+	Privileged      bool              `json:"privileged,omitempty"`
+	Volumes         []string          `json:"volumes,omitempty"`
+	EnvironmentKeys []string          `json:"environment_keys,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Command         string            `json:"command,omitempty"`
+	Healthcheck     string            `json:"healthcheck,omitempty"`
+}
+
+type ContainerEvidence struct {
+	ID       string            `json:"id,omitempty"`
+	Name     string            `json:"name,omitempty"`
+	Image    string            `json:"image,omitempty"`
+	State    string            `json:"state,omitempty"`
+	Labels   map[string]string `json:"labels,omitempty"`
+	Networks []string          `json:"networks,omitempty"`
+	Mounts   []string          `json:"mounts,omitempty"`
+}
+
+type PublishedPortEvidence struct {
+	HostIP        string       `json:"host_ip,omitempty"`
+	HostPort      int          `json:"host_port,omitempty"`
+	ContainerPort int          `json:"container_port,omitempty"`
+	Protocol      string       `json:"protocol,omitempty"`
+	Binding       BindingClass `json:"binding_class,omitempty"`
+}
+
+type Evidence struct {
+	Source     string            `json:"source"`
+	Summary    string            `json:"summary"`
+	Details    map[string]string `json:"details,omitempty"`
+	Confidence string            `json:"confidence"`
+}
+
+type Fix struct {
+	Title            string   `json:"title"`
+	Summary          string   `json:"summary"`
+	ComposePatchHint string   `json:"compose_patch_hint,omitempty"`
+	Commands         []string `json:"commands,omitempty"`
+	Warnings         []string `json:"warnings,omitempty"`
+	Safe             bool     `json:"safe"`
+}
+
+type ServiceIntent struct {
+	Category   string   `json:"category"`
+	Confidence string   `json:"confidence"`
+	Signals    []string `json:"signals,omitempty"`
+}
+
+type ReverseProxyEvidence struct {
+	Present        bool       `json:"present"`
+	ServiceName    string     `json:"service_name,omitempty"`
+	ContainerName  string     `json:"container_name,omitempty"`
+	Image          string     `json:"image,omitempty"`
+	Networks       []string   `json:"networks,omitempty"`
+	PublishedPorts []int      `json:"published_ports,omitempty"`
+	Evidence       []Evidence `json:"evidence,omitempty"`
 }
 
 func BuildSummary(findings []Finding) Summary {
