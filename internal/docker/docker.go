@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -12,15 +13,18 @@ import (
 )
 
 type Container struct {
-	ID             string
-	Name           string
-	Image          string
-	State          string
-	Labels         map[string]string
-	PublishedPorts []PublishedPort
-	ExposedPorts   []ExposedPort
-	Mounts         []Mount
-	Binds          []string
+	ID              string
+	Name            string
+	Image           string
+	State           string
+	Labels          map[string]string
+	EnvironmentKeys []string
+	Command         []string
+	PublishedPorts  []PublishedPort
+	ExposedPorts    []ExposedPort
+	Mounts          []Mount
+	Binds           []string
+	Networks        []string
 }
 
 type PublishedPort struct {
@@ -48,7 +52,9 @@ type Result struct {
 	Available  bool
 }
 
+// docker scan start func
 func Discover(ctx context.Context, runner system.Runner) Result {
+	// cli runners
 	ps, err := runner.Run(ctx, "docker", "ps", "--format", "{{.ID}}")
 	if err != nil {
 		return Result{Warnings: []model.Warning{{Source: "docker", Message: fmt.Sprintf("Docker is unavailable: %v", err)}}}
@@ -56,6 +62,7 @@ func Discover(ctx context.Context, runner system.Runner) Result {
 	if ps.ExitCode != 0 {
 		return Result{Warnings: []model.Warning{{Source: "docker", Message: cleanCommandFailure("docker ps", ps)}}}
 	}
+	// fields
 
 	ids := strings.Fields(ps.Stdout)
 	if len(ids) == 0 {
@@ -70,7 +77,7 @@ func Discover(ctx context.Context, runner system.Runner) Result {
 	if inspect.ExitCode != 0 {
 		return Result{Warnings: []model.Warning{{Source: "docker", Message: cleanCommandFailure("docker inspect", inspect)}}}
 	}
-
+	// parse container inspect check
 	containers, err := parseInspect(inspect.Stdout)
 	if err != nil {
 		return Result{Warnings: []model.Warning{{Source: "docker", Message: fmt.Sprintf("docker inspect output could not be parsed: %v", err)}}}
@@ -87,13 +94,16 @@ func parseInspect(data string) ([]Container, error) {
 	containers := make([]Container, 0, len(inspected))
 	for _, item := range inspected {
 		container := Container{
-			ID:     shortID(item.ID),
-			Name:   strings.TrimPrefix(item.Name, "/"),
-			Image:  item.Config.Image,
-			State:  item.State.Status,
-			Labels: item.Config.Labels,
-			Binds:  append([]string(nil), item.HostConfig.Binds...),
+			ID:              shortID(item.ID),
+			Name:            strings.TrimPrefix(item.Name, "/"),
+			Image:           item.Config.Image,
+			State:           item.State.Status,
+			Labels:          item.Config.Labels,
+			EnvironmentKeys: environmentKeys(item.Config.Env),
+			Command:         append([]string(nil), item.Config.Cmd...),
+			Binds:           append([]string(nil), item.HostConfig.Binds...),
 		}
+		// mount all to result
 		for _, mount := range item.Mounts {
 			container.Mounts = append(container.Mounts, Mount{
 				Type:        mount.Type,
@@ -101,6 +111,8 @@ func parseInspect(data string) ([]Container, error) {
 				Destination: mount.Destination,
 			})
 		}
+
+		// ports opened
 		for key, bindings := range item.NetworkSettings.Ports {
 			port, proto, err := ParsePortKey(key)
 			if err != nil {
@@ -121,11 +133,17 @@ func parseInspect(data string) ([]Container, error) {
 				})
 			}
 		}
+		for name := range item.NetworkSettings.Networks {
+			container.Networks = append(container.Networks, name)
+		}
+		// sort of network set to string
+		sort.Strings(container.Networks)
 		containers = append(containers, container)
 	}
 	return containers, nil
 }
 
+// parse key ports, and lower here
 func ParsePortKey(key string) (int, string, error) {
 	parts := strings.Split(key, "/")
 	if len(parts) != 2 {
@@ -138,18 +156,41 @@ func ParsePortKey(key string) (int, string, error) {
 	return port, strings.ToLower(parts[1]), nil
 }
 
+// socket check
 func HasDockerSocket(container Container) bool {
 	for _, bind := range container.Binds {
 		if strings.Contains(bind, "/var/run/docker.sock") {
 			return true
 		}
 	}
+	// mount with socket
 	for _, mount := range container.Mounts {
 		if mount.Source == "/var/run/docker.sock" || mount.Destination == "/var/run/docker.sock" {
 			return true
 		}
 	}
 	return false
+}
+
+// keys trim
+func environmentKeys(values []string) []string {
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		key := value
+		if before, _, ok := strings.Cut(value, "="); ok {
+			key = before
+		}
+		key = strings.TrimSpace(key)
+		if key != "" {
+			seen[key] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func normalizeHostIP(hostIP string) string {
@@ -166,6 +207,7 @@ func shortID(id string) string {
 	return id
 }
 
+// exit code result
 func cleanCommandFailure(command string, result system.Result) string {
 	detail := strings.TrimSpace(result.Stderr)
 	if detail == "" {
@@ -192,12 +234,16 @@ func firstLine(value string) string {
 	return value
 }
 
+// inspect container to parsed data
+
 type inspectContainer struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
 	Config struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
+		Env    []string          `json:"Env"`
+		Cmd    []string          `json:"Cmd"`
 	} `json:"Config"`
 	State struct {
 		Status string `json:"Status"`
@@ -210,6 +256,7 @@ type inspectContainer struct {
 			HostIP   string `json:"HostIp"`
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`
+		Networks map[string]struct{} `json:"Networks"`
 	} `json:"NetworkSettings"`
 	Mounts []struct {
 		Type        string `json:"Type"`
