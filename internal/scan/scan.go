@@ -2,7 +2,6 @@ package scan
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"time"
 
@@ -13,9 +12,19 @@ import (
 	"github.com/Za1kafps/exposeguard/internal/model"
 	"github.com/Za1kafps/exposeguard/internal/rules"
 	"github.com/Za1kafps/exposeguard/internal/system"
+	"go.uber.org/fx"
 )
 
 const Version = "0.1.0"
+
+var Module = fx.Module(
+	"scan",
+	fx.Provide(
+		NewClock,
+		NewHostnameProvider,
+		NewService,
+	),
+)
 
 type Options struct {
 	ComposeFile string
@@ -25,18 +34,73 @@ type Options struct {
 	Verbose     bool
 }
 
+type Clock func() time.Time
+
+type HostnameProvider func() (string, error)
+
+type Service struct {
+	docker   *docker.Discovery
+	compose  *compose.Parser
+	firewall *firewall.Discovery
+	listener *listener.Discovery
+	rules    *rules.Evaluator
+	clock    Clock
+	hostname HostnameProvider
+}
+
+func NewClock() Clock {
+	return time.Now
+}
+
+func NewHostnameProvider() HostnameProvider {
+	return os.Hostname
+}
+
+func NewService(
+	dockerDiscovery *docker.Discovery,
+	composeParser *compose.Parser,
+	firewallDiscovery *firewall.Discovery,
+	listenerDiscovery *listener.Discovery,
+	evaluator *rules.Evaluator,
+	clock Clock,
+	hostname HostnameProvider,
+) *Service {
+	return &Service{
+		docker:   dockerDiscovery,
+		compose:  composeParser,
+		firewall: firewallDiscovery,
+		listener: listenerDiscovery,
+		rules:    evaluator,
+		clock:    clock,
+		hostname: hostname,
+	}
+}
+
 func Run(ctx context.Context, runner system.Runner, options Options) (model.Report, error) {
+	service := NewService(
+		docker.NewDiscovery(runner),
+		compose.NewParser(),
+		firewall.NewDiscovery(runner),
+		listener.NewDiscovery(runner),
+		rules.NewEvaluator(),
+		NewClock(),
+		NewHostnameProvider(),
+	)
+	return service.Run(ctx, options)
+}
+
+func (s *Service) Run(ctx context.Context, options Options) (model.Report, error) {
 	var warnings []model.Warning
 
 	var dockerResult docker.Result
 	if !options.NoDocker {
-		dockerResult = docker.Discover(ctx, runner)
+		dockerResult = s.docker.Discover(ctx)
 		warnings = append(warnings, dockerResult.Warnings...)
 	}
 
 	var composeProject *compose.Project
 	if options.ComposeFile != "" {
-		project, err := compose.ParseFile(options.ComposeFile)
+		project, err := s.compose.ParseFile(options.ComposeFile)
 		if err != nil {
 			return model.Report{}, err
 		}
@@ -45,17 +109,17 @@ func Run(ctx context.Context, runner system.Runner, options Options) (model.Repo
 
 	var firewallResult firewall.Result
 	if !options.NoFirewall {
-		firewallResult = firewall.Discover(ctx, runner)
+		firewallResult = s.firewall.Discover(ctx)
 		warnings = append(warnings, firewallResult.Warnings...)
 	}
 
 	var listenerResult listener.Result
 	if !options.NoListeners {
-		listenerResult = listener.Discover(ctx, runner)
+		listenerResult = s.listener.Discover(ctx)
 		warnings = append(warnings, listenerResult.Warnings...)
 	}
 
-	findings := rules.Evaluate(rules.Input{
+	findings := s.rules.Evaluate(rules.Input{
 		Docker:      dockerResult.Containers,
 		Compose:     composeProject,
 		Firewall:    firewallResult.State,
@@ -66,27 +130,23 @@ func Run(ctx context.Context, runner system.Runner, options Options) (model.Repo
 		DockerOK:    options.NoDocker || dockerResult.Available,
 	})
 
-	hostname, _ := os.Hostname()
+	hostname, _ := s.hostname()
 	report := model.Report{
 		Metadata: model.Metadata{
 			Tool:        "exposeguard",
 			Version:     Version,
-			GeneratedAt: time.Now(),
+			GeneratedAt: s.clock(),
 			Hostname:    hostname,
 		},
 		Findings: findings,
 		Warnings: warnings,
+		Capabilities: model.ScannerCapabilities{
+			Docker:    !options.NoDocker,
+			Compose:   options.ComposeFile != "",
+			Firewall:  !options.NoFirewall,
+			Listeners: !options.NoListeners,
+		},
 	}
 	report.Summary = model.BuildSummary(findings)
 	return report, nil
-}
-
-func WriteOutput(path string, data []byte) error {
-	if path == "" {
-		return nil
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write report: %w", err)
-	}
-	return nil
 }
