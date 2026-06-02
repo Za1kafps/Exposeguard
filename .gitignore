@@ -3,7 +3,9 @@
 /dist/
 *.test
 *.out
+*.coverprofile
 coverage.txt
+coverage/
 
 # Local env
 .env
@@ -20,9 +22,12 @@ Thumbs.db
 
 # Reports
 *.sarif
+exposeguard.json
+exposeguard.md
 exposeguard-report.*
+reports/
 
-# Local Codex / agent instructions
+# Local instructions
 AGENTS.md
 CODEX_TASK.md
 .codex/
