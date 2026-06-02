@@ -1,11 +1,14 @@
 package rules
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Za1kafps/exposeguard/internal/compose"
 	"github.com/Za1kafps/exposeguard/internal/docker"
 	"github.com/Za1kafps/exposeguard/internal/firewall"
+	"github.com/Za1kafps/exposeguard/internal/listener"
 	"github.com/Za1kafps/exposeguard/internal/model"
 )
 
@@ -63,6 +66,93 @@ func TestEvaluateDangerousServices(t *testing.T) {
 	}
 }
 
+func TestExposureChainConstruction(t *testing.T) {
+	project := compose.Project{
+		Path: "docker-compose.yml",
+		Services: []compose.Service{{
+			Name: "db", Image: "postgres:16", Ports: []string{"5432:5432"}, Networks: []string{"internal"}, EnvironmentKeys: []string{"POSTGRES_PASSWORD"},
+		}},
+	}
+	container := containerWithPort("project-db-1", "postgres:16", 5432, 5432)
+	container.Labels = map[string]string{"com.docker.compose.service": "db"}
+	container.Networks = []string{"internal"}
+	findings := Evaluate(Input{
+		Docker:    []docker.Container{container},
+		Compose:   &project,
+		Firewall:  firewall.State{UFWStatus: "active", HasDockerChain: true},
+		Listeners: []listener.Listener{{Protocol: "tcp", LocalIP: "0.0.0.0", Port: 5432, Process: "docker-proxy", Binding: model.BindingPublic}},
+		DockerOK:  true,
+	})
+	if len(findings) == 0 {
+		t.Fatal("expected findings")
+	}
+	got := findings[0]
+	if got.Compose == nil || got.Container == nil || got.PublishedPort == nil {
+		t.Fatalf("chain is incomplete: %#v", got)
+	}
+	if got.Compose.ServiceName != "db" || got.Container.Name != "project-db-1" || got.PublishedPort.HostPort != 5432 {
+		t.Fatalf("unexpected chain endpoints: %#v", got)
+	}
+	if len(got.Firewall) == 0 || len(got.Listener) == 0 {
+		t.Fatalf("expected firewall and listener evidence: %#v", got.Evidence)
+	}
+	if got.Intent.Category != "database" {
+		t.Fatalf("intent = %q, want database", got.Intent.Category)
+	}
+	if len(got.Fixes) == 0 {
+		t.Fatal("expected fixes")
+	}
+}
+
+func TestReverseProxyBypassDetection(t *testing.T) {
+	project := compose.Project{
+		Path: "docker-compose.yml",
+		Services: []compose.Service{
+			{Name: "proxy", Image: "traefik:v3", Ports: []string{"80:80", "443:443"}, Networks: []string{"edge"}},
+			{Name: "api", Image: "example/backend-api", Ports: []string{"0.0.0.0:3000:3000"}, Expose: []string{"3000"}, Networks: []string{"edge"}},
+		},
+	}
+	api := containerWithPort("project-api-1", "example/backend-api", 3000, 3000)
+	api.Labels = map[string]string{"com.docker.compose.service": "api"}
+	api.Networks = []string{"edge"}
+	findings := Evaluate(Input{
+		Docker:      []docker.Container{api},
+		Compose:     &project,
+		Firewall:    firewall.State{UFWStatus: "inactive"},
+		NoListeners: true,
+		DockerOK:    true,
+	})
+	if len(findings) == 0 {
+		t.Fatal("expected findings")
+	}
+	if findings[0].RuleID != RuleReverseProxyBypass {
+		t.Fatalf("rule = %q, want %q: %#v", findings[0].RuleID, RuleReverseProxyBypass, findings[0])
+	}
+	if findings[0].ReverseProxy == nil || findings[0].ReverseProxy.ServiceName != "proxy" {
+		t.Fatalf("reverse proxy evidence missing: %#v", findings[0].ReverseProxy)
+	}
+}
+
+func TestNoEnvironmentValuesLeaked(t *testing.T) {
+	project := compose.Project{Path: "docker-compose.yml", Services: []compose.Service{{
+		Name: "db", Image: "postgres:16", Ports: []string{"5432:5432"}, EnvironmentKeys: []string{"POSTGRES_PASSWORD"}, Labels: map[string]string{"app.password": "supersecret"},
+	}}}
+	container := containerWithPort("db", "postgres:16", 5432, 5432)
+	container.Labels = map[string]string{"com.docker.compose.service": "db", "secret.label": "supersecret"}
+	findings := Evaluate(Input{Docker: []docker.Container{container}, Compose: &project, Firewall: firewall.State{UFWStatus: "inactive"}, NoListeners: true, DockerOK: true})
+	data, err := json.Marshal(findings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "supersecret") {
+		t.Fatalf("secret value leaked in report: %s", text)
+	}
+	if !strings.Contains(text, "POSTGRES_PASSWORD") {
+		t.Fatalf("environment key missing from report: %s", text)
+	}
+}
+
 func TestEvaluateComposeHostNetwork(t *testing.T) {
 	project := compose.Project{Services: []compose.Service{{Name: "api", Image: "example/api", NetworkMode: "host"}}}
 	findings := Evaluate(Input{Compose: &project, NoDocker: true, NoFirewall: true, NoListeners: true})
@@ -84,12 +174,12 @@ func TestEvaluateDockerCompletenessFindings(t *testing.T) {
 		{
 			name:   "docker unavailable is explicit",
 			input:  Input{NoFirewall: true, NoListeners: true},
-			wantID: "EG-INFO-DOCKER-UNAVAILABLE",
+			wantID: RuleDockerUnavailable,
 		},
 		{
 			name:     "no published ports requires successful discovery",
 			input:    Input{DockerOK: true, NoFirewall: true, NoListeners: true},
-			wantID:   "EG-INFO-DOCKER-NO-PUBLISHED-PORTS",
+			wantID:   RuleNoPublishedPorts,
 			notTitle: "Docker discovery is unavailable",
 		},
 	}
